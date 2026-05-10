@@ -1,0 +1,114 @@
+"""embeddedexample: regular FP32 """
+
+import torch
+import time
+from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
+from flwr.clientapp import ClientApp
+
+from embeddedexample.task import Net, load_data_from_disk
+from embeddedexample.task import test as test_fn
+from embeddedexample.task import train as train_fn
+
+app = ClientApp()
+
+#additional functions
+def identity_state_dict(state_dict):
+    """No compression: keep FP32 as-is."""
+    return {k: v.detach().cpu() for k, v in state_dict.items()}
+
+
+@app.train()
+def train(msg: Message, context: Context):
+    """Train the model on local data."""
+
+    # start round time tracking
+    start_round = time.time()
+
+
+    # Read from run config
+    local_epochs = context.run_config["local-epochs"]
+    learning_rate = context.run_config["learning-rate"]
+
+    # Load the model and initialize it with the received weights
+    model = Net()
+    # communication receive time started to load model from client from server
+    comm_start_recv = time.time()
+    model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
+    # communication receive time recorded
+    comm_recv_time = time.time() - comm_start_recv
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # Load the data
+    # Read the node_config to know where dataset is located
+    dataset_path = context.node_config["dataset-path"]
+    # Read run_config to fetch hyperparameters relevant to this run
+    batch_size = context.run_config["batch-size"]
+    trainloader, _ = load_data_from_disk(dataset_path, batch_size)
+
+    # Call the training function
+    train_loss = train_fn(
+        model,
+        trainloader,
+        local_epochs,
+        learning_rate,
+        device,
+    )
+
+    # Construct and return reply Message
+    # start recording how long it takes to send model weight updates from client to server
+    comm_start_send = time.time()
+    model_record = ArrayRecord(model.state_dict())
+    # communication send time recorded
+    comm_send_time = time.time() - comm_start_send
+    metrics = {
+        "train_loss": train_loss,
+        "num-examples": len(trainloader.dataset),
+        "total_round_time": float(time.time() - start_round),
+        "comm_recv_time": float(comm_recv_time),
+        "comm_send_time": float(comm_send_time),
+    }
+    metric_record = MetricRecord(metrics)
+    content = RecordDict({"arrays": model_record, "metrics": metric_record})
+    return Message(content=content, reply_to=msg)
+
+
+@app.evaluate()
+def evaluate(msg: Message, context: Context):
+    """Evaluate the model on local data."""
+    start_round = time.time()
+    # Load the model and initialize it with the received weights
+    model = Net()
+    comm_start_recv = time.time()
+    model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
+    comm_recv_time = time.time() - comm_start_recv
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # Load the data
+    # Read the node_config to know where dataset is located
+    dataset_path = context.node_config["dataset-path"]
+    # Read run_config to fetch hyperparameters relevant to this run
+    batch_size = context.run_config["batch-size"]
+    _, valloader = load_data_from_disk(dataset_path, batch_size)
+
+    # Call the evaluation function
+    eval_loss, eval_acc = test_fn(
+        model,
+        valloader,
+        device,
+    )
+    comm_start_send = time.time()
+    # Construct and return reply Message
+    metrics = {
+        "eval_loss": eval_loss,
+        "eval_acc": eval_acc,
+        "num-examples": len(valloader.dataset),
+        "comm_recv_time": float(comm_recv_time),
+        "comm_send_time": float(comm_send_time),
+    }
+    metric_record = MetricRecord(metrics)
+    comm_send_time = time.time() - comm_start_send
+    content = RecordDict({"metrics": metric_record})
+    return Message(content=content, reply_to=msg)
